@@ -1,0 +1,38 @@
+
+LogEntryLength           = 1024
+MaxLogFileSize           = 256MB
+MaxLogFileCount          = 1
+RemoveLogFile            = /opt/sessiond/savelogfile /var/log/old
+MaxProtocolLogFileSize   = 256MB
+MaxProtocolLogFileCount  = 1
+RemoveProtocolLogFile    = /opt/sessiond/savelogfile /var/log/old
+MaxQueuetime             = 3
+ReturnQueuetime          = 1
+ReturnRuntime            = 1
+Daemonize                = 0
+ServiceCache             = /tmp/ServiceCache
+
+
+ServiceID                = YOURNAME-xirca
+ShellCommand             = /opt/my_xirca/session
+ServiceSocket            = /tmp/my-xirca
+LogFile                  = /var/log/my-xirca.log
+MinSessions              = 1
+MaxSessions              = 1
+MaxClients               = 100
+OperationMode            = EXECUTE
+IOTimeout                = 1
+MaxRuntime               = 130
+MaxRuntime[CheckDomain]  = 5
+MaxRuntime[CheckDomains] = 5
+ClientCommandTimeout     = 130
+SessionPollInterval      = 999999999
+MinSessionTTL            = 3600
+MaxSessionTTL            = 3600
+ClientLoginTimeout       = 8
+ClientPassword[whois]    = whois0
+ClientPassword[admin]    = adx123
+
+IPv4port                 = 0
+IPv4pattern              = ^10.
+

@@ -1,0 +1,62 @@
+#!/bin/sh
+
+CONFIG=$1
+
+echo '#! /bin/sh
+#
+# skeleton	example file to build /etc/init.d/ scripts.
+#		This file should be used to construct scripts for /etc/init.d.
+#
+#		Written by Miquel van Smoorenburg <miquels@cistron.nl>.
+#		Modified for Debian 
+#		by Ian Murdock <imurdock@gnu.ai.mit.edu>.
+#
+# Version:	@(#)skeleton  1.9  26-Feb-2001  miquels@cistron.nl
+#
+
+ulimit -n 65536
+
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+DAEMON=/opt/sessiond/new-sessiond2
+NAME=sessiond-'$CONFIG'
+DESC='$CONFIG'
+CONFIG='$CONFIG'
+PIDFILE=/var/run/$NAME.pid
+
+test -x $DAEMON || exit 0
+
+set -e
+
+case "$1" in
+  start)
+	echo -n "Starting $DESC: "
+	start-stop-daemon --start --make-pidfile --pidfile $PIDFILE --quiet \
+		--background --exec $DAEMON -- $CONFIG
+	echo "$NAME."
+	;;
+  stop)
+	echo -n "Stopping $DESC: "
+	start-stop-daemon --stop --pidfile $PIDFILE --quiet --oknodo
+	echo "$NAME."
+	;;
+  reload|force-reload)
+	echo "Reloading $DESC configuration files."
+	start-stop-daemon --stop --signal HUP --pidfile $PIDFILE --oknodo
+  	;;
+  restart)
+	echo -n "Restarting $DESC: "
+	start-stop-daemon --stop --pidfile $PIDFILE --oknodo
+	sleep 4
+	start-stop-daemon --start --make-pidfile --pidfile $PIDFILE --quiet \
+		--background --exec $DAEMON -- $CONFIG
+	echo "$NAME."
+	;;
+  *)
+	N=/etc/init.d/$NAME
+	echo "Usage: $N {start|stop|restart|reload|force-reload}" >&2
+	exit 1
+	;;
+esac
+
+exit 0
+#EOF#'

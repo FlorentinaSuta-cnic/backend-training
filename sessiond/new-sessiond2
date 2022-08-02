@@ -1,0 +1,1800 @@
+#!/usr/bin/perl -w
+
+
+use Socket qw(IPPROTO_TCP TCP_NODELAY);
+use IO::Handle;
+use IO::Socket::INET;
+use IO::Socket::UNIX;
+use IPC::Open3;
+use POSIX 'setsid';
+use POSIX ":sys_wait_h";
+use Sys::Hostname;
+use Data::Dumper;
+
+use FindBin;
+use lib "$FindBin::Bin/lib";
+
+my $version = "0.91";
+
+$ENV{CHARSET} = "utf-8";
+
+my $hires = undef;
+eval ( "use Time::HiRes;" );
+if ($@) {
+    $hires=0;
+    print STDERR "Time::HiRes not installed - command runtime not available!\n";
+}
+else {
+    import Time::HiRes;
+    $hires=1;
+}
+
+
+my $rate_limit_counter = 0;
+my @rate_limit_stack = (0);
+my $rate_limit_check_time = ($hires)? Time::HiRes::time() : time();
+
+
+my %udpClients = ();
+my %logClients = ();
+
+my $logFile = undef;
+
+my $last_log_newline = 0;
+
+my $last_offline_time = 0;
+
+sub logMessage {
+	my $message = shift;
+	my $status = shift;
+	my $period = shift;
+	my $session = shift;
+	my $client = shift;
+
+	if ( $status eq "QT" ) {
+#		print STDERR $message;
+		$message =~ s/(\n\s*(?:PASS|PASSWORD|PW)\s*\=\s*)[^\n]+/$1******/iog;
+
+		if ( $message =~ /\n\s*COMMAND\s*\=\s*(Query|StatusUser|StatusAccount|GetEnvironment|GetUserIndex|CheckAuthorization)/io ) {
+			$client->{nolog} = 1;
+		}
+	}
+
+	$message =~ s/\\/\\\\/og;
+	$message =~ s/\"/\\"/og;
+	$message =~ s/\r/\\r/og;
+	$message =~ s/\t/\\t/og;
+	$message =~ s/\n/\\n/og;
+	$message = '"'.$message.'"';
+	
+	$status = '--' if !defined $status;
+	$period = 0 if !defined $period;
+
+	my $session_id = '-';
+	my $direction = '-';
+	my $client_id = '-';
+	
+	my $nolog = 0;
+
+	if ( defined $session ) {
+		if ( exists $session->{log_id} ) {
+			$session_id = $session->{log_id};
+		}
+		elsif ( exists $session->{pid} ) {
+			my $pid = $session->{pid};
+#			$pid = "0$pid" while ( length($pid) < 5 );
+			$session_id = "PID/$pid";
+		}
+		else {
+			$session_id = $session->{id};
+		}
+		$nolog = 1 if $session->{nolog};
+	}
+
+	if ( defined $client ) {
+		if ( exists $client->{log_id} ) {
+			$client_id = $client->{log_id};
+		}
+		else {
+			$client_id = $client->{id};
+		}
+		$nolog = 1 if $client->{nolog};
+	}
+	
+	$direction = "<" if $status =~ /^(QT)$/;
+	$direction = ">" if $status =~ /^(RT|SB|TO|OF|OV)$/;
+
+	my $time = ($hires)? Time::HiRes::time() : time();
+	my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime($time);
+	$year += 1900;
+	$mon++; $mon = "0".int($mon) if ($mon < 10);
+	$mday = "0".int($mday) if ($mday < 10);
+	$hour = "0".int($hour) if ($hour < 10);
+	$min = "0".int($min) if ($min < 10);
+	$sec = "0".int($sec) if ($sec < 10);
+	my $msec = 0;
+	if ( $time =~ /\./ ) {
+	    $msec = $';
+	}
+	while ( length($msec) < 3 ) { $msec .= "0"; }
+	$msec = $1 if $msec =~ /^(...)/;
+	my $date = "$year-$mon-$mday $hour:$min:$sec.$msec";
+	
+	my $mperiod = 0;
+	if ( $period =~ /\./ ) {
+		$period = $`;
+		$mperiod = $';
+	}
+	while ( length($period) < 3 ) {
+		if ( $period =~ /^\-/ ) {
+			$period = "-0$'";
+		}
+		else {
+			$period = "0$period"
+		};
+	}
+	while ( length($mperiod) < 3 ) { $mperiod .= "0"; }
+	$mperiod = $1 if $mperiod =~ /^(...)/;
+	$period = "$period.$mperiod";
+	
+	
+	$entry = "$date $status $period $session_id $direction $client_id $message\n";
+	
+	if ( ($direction eq "<") && (defined $session) && (!exists $session->{log_buffer}) ) {
+		$session->{log_buffer} = "";
+	}
+	
+	my $output = "";
+	
+	if ( (defined $session) && (exists $session->{log_buffer}) ) {
+		$session->{log_buffer} .= $entry;
+		if ( $direction eq ">" ) {
+			$output .= "\n" if !$last_log_newline;
+			$output .= $session->{log_buffer};
+			$output .= "\n";
+			$last_log_newline = 1;
+			delete $session->{log_buffer};
+		}
+	}
+	else {
+		$output .= "$entry";
+		$last_log_newline = 0;
+	}
+	
+	if ( !$nolog ) {
+		if ( getEnv("LogFile") ) {
+			if ( !defined $logFile ) {
+				$logFile = new IO::Handle;
+				open $logFile, ">>".getEnv("LogFile");
+			}
+			syswrite $logFile, $output;
+		}
+		else {
+#			print STDERR $output;
+		}
+	}
+
+	foreach my $key ( keys %logClients ) {
+		my $c = $logClients{$key};
+		$c->{'buffer_send'} .= $output;
+	}
+}
+
+
+
+
+
+sub wait_to_start {
+	my $wait = 1;
+	$wait = 0;
+
+	while ( $wait ) {
+		select undef, undef, undef, 0.1;
+	        my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst)
+	            = localtime(time+2);
+		print STDERR "$hour:$min:$sec\n";
+		$wait = 0 if $hour >= 8;
+	}
+}
+
+
+my $start_next_session_time = time;
+my $next_master_update = time;
+
+my $session_start_delay = 2;
+
+$_ = $0;
+if ( /\/([^\/]*)$/ ) {
+    chdir $`;
+}
+
+my $opmode = shift @ARGV;
+my %envHash = ( "CONFIGFILE" => $opmode );
+
+my $serviceSocket = undef;
+my $serviceSocketFile = undef;
+my $updSocket = undef;
+my $tcpSocket = undef;
+
+
+my @sessions;
+my @clients;
+my $sessionId = 0;
+my $clientId  = 0;
+
+my $timeoutResponse = "[RESPONSE]\nCODE=421\nDESCRIPTION=SESSION TIMEOUT\n";
+my $nosessionsResponse = "[RESPONSE]\nCODE=421\nDESCRIPTION=SERVICE OFFLINE\n";
+my $brokenSessionResponse = "[RESPONSE]\nCODE=421\nDESCRIPTION=SESSION BROKEN\n";
+my $overloadResponse = "[RESPONSE]\nCODE=421\nDESCRIPTION=SERVICE OVERLOAD\n";
+
+my %batch_commands = ();
+my $batch_commands_processing = 0;
+
+
+
+logMessage("Session Daemon started!");
+
+
+sub load_batch {
+ 
+    my $dir = getEnv("BatchDir");
+    return if !defined $dir;
+    
+    opendir BATCHDIR, "$dir/new" or die "Invalid dir: $dir/new!\n";
+    print STDERR "Reading batch-dir $dir/new ...\n";
+    my @files = readdir BATCHDIR;
+    closedir BATCHDIR;
+
+    foreach my $file ( @files ) {
+    	next if $file !~ /\.cmd$/;
+	my $job = $`;
+	next if -e "$dir/done/$file";
+	
+    	my ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size, $atime,$mtime,$ctime,$blksize,$blocks)
+                          = stat("$dir/new/$file");
+# IGNORE JOBS YOUNGER THAN 5 SECONDS
+	next if time() < ($mtime+5);
+
+    	print STDERR "Reading batch job: $file ...\n";
+	
+	open BATCH, "<$dir/new/$file";
+	$batch_commands{$job} = join "", <BATCH>;
+	$batch_commands{$job} =~ s/\nEOF\n//;
+	close BATCH;
+    }
+    
+#    die(Dumper(\%batch_commands));
+}
+
+
+
+sub openServiceSocket {
+
+    if ( $serviceSocket ) {
+        close $serviceSocket;
+        undef $serviceSocket;
+    }
+    $serviceSocket = new IO::Handle;
+    
+    if ( getEnv('ServiceSocket') =~ /^\// ) {
+        my $file = getEnv('ServiceSocket');
+        while ( $file =~ s/\.\./\./og ) {}
+        while ( $file =~ s/\/\//\//og ) {}
+        socket( $serviceSocket, PF_UNIX, SOCK_STREAM, 0 ) || die "socket: $!";
+        unlink $file;
+        bind ( $serviceSocket, sockaddr_un($file) );
+        listen( $serviceSocket, SOMAXCONN ) || die "listen: $!";
+	$serviceSocketFile = $file;
+    }
+    else {
+        undef $serviceSocket;
+    }
+}
+
+sub openTCPSocket {
+
+    if ( $tcpSocket ) {
+        close $tcpSocket;
+        undef $tcpSocket;
+    }
+    $tcpSocket = new IO::Handle;
+    
+    if ( getEnv('IPv4port') =~ /^[0-9]+$/ ) {
+#        my $port = getEnv('IPv4port');
+#	$port = $port % 65536;
+
+#        my $proto = getprotobyname("tcp");
+#        socket( $tcpSocket, PF_INET, SOCK_STREAM, $proto ) || die "socket: $!";
+#        setsockopt( $tcpSocket, SOL_SOCKET, SO_REUSEADDR, pack("l", 1)) || die "setsockopt: $!";
+#        bind( $tcpSocket, sockaddr_in($port, INADDR_ANY) ) || die "bind: $!";
+#        listen( $tcpSocket, SOMAXCONN ) || die "listen: $!";
+
+	$tcpSocket = new IO::Socket::INET( LocalPort => getEnv('IPv4port'), Proto => "tcp", Listen => SOMAXCONN, Reuse => 1 );
+ 	die "Could not create TCP Socket: $!\n" if !$tcpSocket;
+	setEnv('IPv4port', $tcpSocket->sockport());
+	print STDERR "TCP-Port: ".$tcpSocket->sockport()."\n";
+    }
+    else {
+        undef $tcpSocket;
+    }
+}
+
+
+
+sub openUDPSocket {
+
+    if ( $udpSocket ) {
+        close $udpSocket;
+        undef $udpSocket;
+    }
+    $udpSocket = new IO::Handle;
+    
+    if ( getEnv('IPv4port') =~ /^[0-9]+$/ ) {
+	$udpSocket = new IO::Socket::INET( LocalPort => getEnv('IPv4port'), Proto => "udp", Reuse => 1 );
+	die "Could not create UDP Socket: $!\n" if !$udpSocket;
+	
+	print STDERR "UDP-Port: ".getEnv('IPv4port')."\n";
+
+    }
+    else {
+        undef $udpSocket;
+    }
+}
+
+
+
+
+sub checkIPv4address {
+    my $ip = shift;
+    my $pattern = getEnv('IPv4pattern');
+    return undef if !length($pattern);
+    return undef if !length($ip);
+    return $ip =~ /$pattern/;
+}
+
+
+my $master_url = undef;
+my $service_ip = undef;
+
+sub getMasterURL {
+    my $service_cache = getEnv("ServiceCache");
+    return undef if !defined $service_cache;
+    
+    return $master_url if defined $master_url;
+    
+    my $cache = new IO::Socket::UNIX($service_cache);
+    syswrite $cache, "LOCATE SERVICE .\n";
+    my $cr = <$cache>;
+    return undef if $cr !~ /^OK ([^\s]+)/;
+    $master_url = $1;
+    return $master_url;
+}
+
+
+sub updateMaster {
+    my $now = time();
+    return if $next_master_update > $now;
+    $next_master_update = $now+4;
+    
+    return if !defined $udpSocket;
+    
+    my $service_id = getEnv("ServiceID");
+    return if !defined $service_id;
+    
+    my $master_url = getMasterURL();
+    return if !defined $master_url;
+    
+    return undef if $master_url !~ /^mregd(?:\+udp)?:\/\/([^:]+):([^\@]+)\@([^:]+):(\d+)/;
+    my $master_user = $1;
+    my $master_pw = $2;
+    my $master_host = $3;
+    my $master_port = $4;
+
+    if ( !defined $service_ip ) {
+        my $iaddr = gethostbyname(hostname());
+        $service_ip = inet_ntoa($iaddr);
+    }
+	return if !defined $service_ip;
+	
+    my $port = getEnv("IPv4port");
+    my $service_url = "mregd+udp://$master_user:$master_pw\@$service_ip:$port\n";
+
+    my $command = "PTF1.0/request/command\n"
+                . "auth=$master_user:$master_pw\n"
+                . "[COMMAND]\n"
+		. "command=RegisterService\n"
+		. "service=$service_id $service_url\n"
+		;
+		
+
+    send($udpSocket, $command, 0, sockaddr_in( $master_port, inet_aton( $master_host ) ));
+}
+
+
+
+
+sub handleUDPStatusRequest {
+    my $payload = shift;
+    
+    my %data = splitValueBlock($payload);
+    
+    my $auth = $data{'AUTH'};
+    my $id = $data{'ID'};
+    return "" if !defined $auth;
+    return "" if $auth !~ /:/;
+    my $user = $`;
+    my $pass = $';
+    return "" if !(getEnv("ClientPassword[$user]") eq $pass);
+
+    my $iaddr = gethostbyname(hostname());
+    my $ip = inet_ntoa($iaddr);
+    my $port = getEnv("IPv4port");
+    
+    my $r = "";
+    $r .= "id=$id\n";
+    $r .= "socket=mregd://$user:$pass\@$ip:$port\n";
+    $r .= "sessionsonline=".(getEnv("SessionsOnline") || 0)."\n";
+    $r .= "maxsessions=".(getEnv("MaxSessions") || 0)."\n";
+    $r .= "clients=".(getEnv("Clients") || 0)."\n";
+    
+    
+    return $r;
+    
+}
+
+
+sub acceptUDPClient {
+    my $hispaddr = shift;
+    my $payload = shift;
+    my $ip = shift;
+    my $port = shift;
+    
+#    print STDERR "$payload\n";
+
+    return undef if $payload !~ /(^|\n)(\[)/;
+    
+    $payload = $`.$1;
+    my $request = $2.$';
+       
+    my %data = splitValueBlock($payload);
+    
+    my $auth = $data{'AUTH'};
+    my $id = $data{'ID'};
+    return "" if !defined $auth;
+    return "" if $auth !~ /:/;
+    my $user = $`;
+    my $pass = $';
+    return "" if !(getEnv("ClientPassword[$user]") eq $pass);
+
+    $clientId++;
+
+    my $c = {};
+
+    $c->{'id'} = $clientId;
+    $c->{'udp'} = $hispaddr;
+    $c->{'udpid'} = $id;
+    $c->{'command'} = $request;
+    $c->{'response'} = '';
+    $c->{'timestamp_created'} = time;
+    $c->{'timestamp_command'} = time;
+    $c->{'buffer_send'} = '';
+    $c->{'buffer_recv'} = '';
+    $c->{'paddr'} = $hispaddr;    
+    $c->{'status'} = 'COMMAND';
+    $c->{'buffer_send'} = '';
+
+    $c->{'log_id'} = "UDP/$ip/$port";
+
+    $c->{'timestamp_command'} = time;
+    $c->{'timestamp_queuetime'} = ($hires)? Time::HiRes::time() : time();;
+    my %command_hash = splitCommand($c->{'command'});
+    $c->{'command_hash'} = \%command_hash;
+    $c->{'timeout'}     = getEnv('MaxRuntime');
+    $c->{'wait'}        = getEnv('MaxQueuetime');
+
+    push @clients, $c;
+    setEnv('clients', $#clients+1);
+    return $c;
+}
+
+
+sub handleUDPRequest {
+    my $data = shift;
+    
+    if ( $data =~ /^PTF1\.[0-9]+\/request\/status\n/ ) {
+        return "PTF1.0/response/status\n" . handleUDPStatusRequest($');
+    }
+    
+    return "PTF1.0/response/error\n";
+}
+
+
+
+
+sub handleUDPClient {
+    my $data;
+    
+    return if getEnv('Shutdown');
+    
+    ($hispaddr = recv($udpSocket, $data, 512, 0))        || die "recv: $!";
+    my ($port, $hisiaddr) = sockaddr_in($hispaddr);
+    my $ip = inet_ntoa($hisiaddr);
+    
+    if ( checkIPv4address($ip) ) {
+
+	if ( $data =~ /^PTF1\.[0-9]+\/request\/command\n/ ) {
+            acceptUDPClient($hispaddr, $', $ip, $port);
+	}
+    
+	elsif ( $data =~ /^PTF1\.[0-9]+\/response\/command\n/ ) {
+# IGNORE SILENTLY
+	}
+
+        else {
+            my $debug = "INCOMING UDP: $ip:$port\n";
+	    $debug = "";
+            defined(send($udpSocket, $debug.handleUDPRequest($data), 0, $hispaddr))    || die "send $hisiaddr: $!";
+	}
+    }
+}
+
+
+sub acceptTCPClient {
+
+    $clientId++;
+
+    my $c = {};
+
+    $c->{'id'} = $clientId;
+    $c->{'command'} = '';
+    $c->{'response'} = '';
+    $c->{'timestamp_created'} = time;
+    $c->{'timestamp_command'} = time;
+    $c->{'buffer_send'} = '';
+    $c->{'buffer_recv'} = '';
+    $c->{'handle_client'} = new IO::Handle;
+    $c->{'paddr'} = accept( $c->{'handle_client'}, $tcpSocket );    
+    $c->{'handle_client'}->autoflush(1);
+	setsockopt($c->{'handle_client'}, IPPROTO_TCP, TCP_NODELAY, 1);
+
+    $c->{'status'} = 'LOGIN';
+    $c->{'buffer_send'} = 'login:';
+
+    my($port,$hisiaddr) = sockaddr_in($c->{'paddr'});
+    my $ip = inet_ntoa($hisiaddr);
+    
+    $c->{'log_id'} = "TCP/$ip/$port";
+    
+    if ( checkIPv4address($ip) ) {
+        push @clients, $c;
+        setEnv('clients', $#clients+1);
+        return $c;
+    }
+    else {
+        syswrite $c->{'handle_client'}, "IP $ip not allowed\n";
+        shutdown $c->{'handle_client'}, 2;
+        close $c->{'handle_client'};
+	return undef;
+    }
+}
+
+
+
+sub splitValueBlock {
+    my %data;
+    my $b = shift;
+    while ( $b =~ /(?:\n|^)([\w\d\[\]\-]+)[ ]*\=[ ]*([^\n]*)/ ) {
+        $b = $';
+        my $id = uc($1);
+        my $val = $2;
+        chomp $val;
+        $id =~ s/(\s|_)//og;
+        $data{$id} = $val if ( defined $val );
+    }
+    return %data;
+}
+
+
+sub loadEnv {
+    my $configFile = shift || return 1;
+    $configFile = "config/".$configFile;
+    open CONFIG, "<$configFile" or die "cannot open $configFile\n";
+    my $conf = "";
+    $conf .= $_ while <CONFIG>;
+    close CONFIG;
+    %envHash = splitValueBlock($conf);
+    return 0;
+}
+
+sub getEnv {
+    my $id = shift;
+    return undef if !defined $id;
+    $id = uc($id);
+    return $envHash{$id} if exists $envHash{$id};
+    return undef;
+}
+
+sub setEnv {
+    my $id = shift;
+    my $value = shift;
+    return undef if !defined $id;
+    $id = uc($id);
+    
+    if ( ($id eq 'SHUTDOWN') && ($value) ) {
+        terminateSessions();
+    }
+    
+    $envHash{$id} = $value if defined $value;
+    delete $envHash{$id} if !defined $value;
+    return undef;
+}
+
+
+sub splitCommand {
+    my $request = shift;
+    $request =~ s/(^|\n)\[/\000\n\[/og;
+    my @blocks = split /\000/, $request;
+    shift @blocks;
+    my %hash;
+    foreach ( @blocks ) {
+        /\[([^\]]*)\]/;
+        my %data = splitValueBlock($');
+        $hash{uc($1)} = \%data;
+    }
+    return %hash;
+}
+
+
+
+sub terminateSessions {
+    foreach $s ( @sessions ) {
+        print STDERR "Terminate session $s\n";
+        $s->{term} = 1;
+    }
+    setEnv('TerminateSessions');
+}
+
+
+
+sub processClientControlCommand_LIST {
+    my $r = "";
+    foreach ( sort keys %envHash ) {
+        $r .= "$_=$envHash{$_}\n"
+            if !($_ =~ /PASSWORD/i);
+    }
+    return $r;
+}
+
+sub processClientControlCommand_GET {
+    my $id = shift;
+    return '' if (!$id);
+    my $val = getEnv($id);
+    if ( defined $val ) {
+        return "$id=$val\n";
+    } else {
+        return '';
+    }
+}
+
+sub processClientControlCommand_SET {
+    my @args = @_;
+    setEnv($args[0],$args[1]);
+    return '';
+}
+
+
+sub processClientControlCommand_SHUTDOWN {
+    print STDERR "SHUTDOWN\n";
+    setEnv('TerminateSessions', 1);
+    setEnv('Shutdown', 1);
+    return '';
+}
+
+
+sub processClientControlCommand_KILLSERVER {
+    my $s;
+    foreach $s ( @sessions ) {
+        kill 1, $s->{'pid'};
+#        waitpid $s->{'pid'}, 0;
+    }
+    exit 0;
+}
+
+sub processClientControlCommand_RELOADCONFIG {
+    loadEnv(getEnv('CONFIGFILE'));
+    return '';
+}
+
+
+sub processClientControlCommand_RESET {
+    print STDERR "RESET\n";
+#    setEnv('TerminateSessions', 1);
+    my $term_on = time();
+    foreach $s ( @sessions ) {
+        print STDERR "Terminate session $s on $term_on\n";
+        $s->{term_on} = $term_on;
+	$term_on += $session_start_delay;
+    }
+
+    return '';
+}
+
+sub processClientControlCommand {
+    my $c = shift;
+    my $command = shift;
+    return '' if ( !$command );
+    my @args = split /\s+/, $command;
+    $command = uc(shift @args);
+    return processClientControlCommand_LIST      (@args) if ( $command eq 'LIST' );
+    return processClientControlCommand_GET       (@args) if ( $command eq 'GET' );
+    return processClientControlCommand_SET       (@args) if ( $command eq 'SET' );
+    return processClientControlCommand_KILLSERVER(@args) if ( $command eq 'KILLSERVER' );
+    return processClientControlCommand_RELOADCONFIG(@args) if ( $command eq 'RELOADCONFIG' );
+    return processClientControlCommand_RESET(@args) if ( $command eq 'RESET' );
+    return processClientControlCommand_SHUTDOWN(@args) if ( $command eq 'SHUTDOWN' );
+    $logClients{$c} = $c if $command eq 'LOG';
+    $c->{'events'} = 1          if ( $command eq 'EVENTS' );
+    $c->{'status'} = 'DIS'      if ( $command eq 'QUIT' );
+    return '';
+}
+
+sub processClientControlCommands {
+    my $c = shift;
+    my $buffer = shift;
+    while ( $buffer =~ /\n/ ) {
+        $buffer = $';
+        $c->{'buffer_send'} .= processClientControlCommand($c, $`).".\n";
+    }
+    $c->{'buffer_recv'} = $buffer;
+}
+
+
+
+sub processSessionCommand {
+	my $s = shift;
+
+	logMessage( $s->{command}, "QT", $s->{queuetime}, $s, $s->{client} );
+
+	$s->{'buffer_send'} = convertSessionCommand($s);
+	$s->{'runtime_start'} = ($hires)? Time::HiRes::time() : time();
+}
+
+
+
+sub finishSessionResponse {
+	my $s = shift;
+	my $response = shift;
+	my $log_status = shift;
+	
+	$s->{'runtime_end'} = ($hires)? Time::HiRes::time() : time();
+	$s->{'response'} = $response;
+
+	if ( defined $s->{'queuetime'} ) {
+		my $returnQueuetime = getEnv("ReturnQueuetime");
+		$returnQueuetime = getEnv("ReturnQueuetime[".$s->{'command_id'}."]")
+			if defined getEnv("ReturnQueuetime[".$s->{'command_id'}."]");
+		$s->{'response'} .= "QUEUETIME=".(int(($s->{'queuetime'})*1000)/1000)."\n"
+			if $returnQueuetime;
+	}
+
+	my $returnRuntime = getEnv("ReturnRuntime");
+	if ( defined $s->{'command_id'} ) {
+		$returnRuntime = getEnv("ReturnRuntime[".$s->{'command_id'}."]")
+			if defined getEnv("ReturnRuntime[".$s->{'command_id'}."]");
+	}
+	$s->{'response'} .= "RUNTIME=".(int(($s->{'runtime_end'}-$s->{'runtime_start'})*1000)/1000)."\n"
+		if $returnRuntime;
+
+	logMessage( $s->{response}, $log_status, $s->{runtime_end} - $s->{runtime_start}, $s, $s->{client} );
+
+
+
+    $s->{'queuetime'} = undef;
+    
+    $s->{'buffer_recv'} = '';
+    
+    if ( defined $s->{'client'} ) {
+        $s->{'client'}->{'response'} = $s->{'response'};
+        $s->{'client'}->{'buffer_send'} = $s->{'response'} . "\nEOF\n";
+        $s->{'client'}->{'status'} = 'RESPONSE';
+        $s->{'client'} = undef;
+    }
+   
+	my $code = $s->{'response'} =~ /\n *code *\= *(\d+)/i ? $1 : 0;
+	my $desc = $s->{'response'} =~ /\n *description *\= *([^\n]*)/i ? $1 : "";
+	
+	if ( ($code == 546) || ($code == 504) ) {
+		delete $s->{'batch_id'};
+		setEnv("BatchDir");
+	}
+
+	if ( (defined $s->{'batch_id'}) && (($code =~ /^4/) || ($desc =~ /not currently open for registration/) || ($desc =~ /is not a valid domain name/)) ) {
+		$batch_commands{$s->{'batch_id'}} = $s->{'batch_command'};
+		delete $s->{'batch_id'};
+		$batch_commands_processing--;
+	}
+
+    if ( defined $s->{'batch_id'} ) {
+    	my $id = $s->{'batch_id'};
+	my $response = $s->{'response'} . "\nEOF\n";
+	delete $s->{'batch_id'};
+	
+	print STDERR "Got response for batch job $id ...\n$response";
+	$batch_commands_processing--;
+	
+	my $batch_dir = getEnv("BatchDir");
+	
+	if ( link "$batch_dir/new/$id.cmd", "$batch_dir/done/$id.cmd" ) {
+		unlink "$batch_dir/new/$id.cmd";
+		open RES, ">$batch_dir/done/$id.rsp";
+		print RES $response;
+		close RES;
+	}
+    }
+	delete $s->{'batch_command'};
+    
+#    my $code = $s->{'response'} =~ /\n *code *\= *(\d+)/i ? $1 : 0;
+	my $eppcode = $s->{'response'} =~ /\n *eppcode *\= *(\d+)/i ? $1 : 0;
+
+    $s->{'status'} = 'DIS' if ($code == 220);
+    $s->{'status'} = 'DIS' if ($code == 547);
+	$s->{'status'} = 'DIS' if ($eppcode == 1500);
+	$s->{'status'} = 'DIS' if ( $code == 0 && $s->{'online'} );
+
+	if ( $s->{'status'} eq "DIS" ) {
+		my $code_log = $s->{'response'} =~ /\n *code *\= *(\d+)/i ? "$1" : "NO CODE";
+		my $description_log = $s->{'response'} =~ /\n *description *\= *([^\r\n\t\f]+)/i ? "$1" : "NO DESCRIPTION";
+		my $eppcode_log = $s->{'response'} =~ /\n *eppcode *\= *(\d+)/i ? "($1)" : "";
+		my $runtime_log = $s->{'response'} =~ /\n *runtime *\= *([\d\.]+)/i ? "RT: $1" : "NO RT";
+		my $online_log = $s->{'online'} ? "session is online" : "session NOT online";
+		my $command_log = "";
+		if ( $s->{'command'} ) {
+			my $c = $s->{'command'} =~ /\n *command *\= *([^\r\n\t\f]+)/i ? uc($1) : "";
+			$command_log = $c;
+			if ( $c =~ /DOMAIN/ ) {
+				if ( $s->{'command'} =~ /\n *domain *\= *([^\r\n\t\f]+)/i ) {
+					$command_log .= " $1";
+				}
+				elsif ( $s->{'command'} =~ /\n *domain0 *\= *([^\r\n\t\f]+)/i ) {
+					$command_log .= " $1";
+				}
+			}
+			elsif ( $c =~ /CONTACT/ ) {
+				if ( $s->{'command'} =~ /\n *contact *\= *([^\r\n\t\f]+)/i ) {
+					$command_log .= " $1";
+				}
+				elsif ( $s->{'command'} =~ /\n *organization *\= *([^\r\n\t\f]+)/i ) {
+					$command_log .= " $1";
+				}
+				elsif ( $s->{'command'} =~ /\n *name *\= *([^\r\n\t\f]+)/i ) {
+					$command_log .= " $1";
+				}
+				elsif ( $s->{'command'} =~ /\n *lastname *\= *([^\r\n\t\f]+)/i ) {
+					$command_log .= " $1";
+				}
+			}
+			elsif ( $c =~ /NAMESERVER/ ) {
+				if ( $s->{'command'} =~ /\n *nameserver *\= *([^\r\n\t\f]+)/i ) {
+					$command_log .= " $1";
+				}
+			}
+			$command_log .= " [$1]"
+				if $s->{'command'} =~ /\n *repository *\= *([^\r\n\t\f]+)/i;
+		}
+		logMessage("SESSION CLOSING [".(getEnv("ServiceID") || "")."] $code_log $description_log $eppcode_log $runtime_log - ".($command_log || $online_log).")", 'LL');
+		return;
+	}
+
+    if ( !($s->{'online'}) ) {
+        $s->{'status'} = 'DIS' if ($code == 530);
+        $s->{'status'} = 'DIS' if ($code =~ /^4/);
+        my $sessions_online = getEnv("SessionsOnline") || 0;
+        $sessions_online++;
+	$s->{'online'} = 1;
+	setEnv("SessionsOnline", $sessions_online);
+    }
+}
+
+
+
+sub processSessionResponse {
+	my $s = shift;
+	
+	$s->{'status'} = 'RESPONSE';
+	finishSessionResponse($s, convertSessionResponse($s), "RT");
+}
+
+
+
+sub processClients {
+    my $c;
+	my $now = time();
+    foreach $c ( @clients ) {
+        if ( ($c->{'timestamp_created'} + 600) < $now  ) {
+			logMessage("Client Timeout after 600s: ".Dumper($c), "CT");
+			$c->{'status'} = 'DIS';
+		}
+
+        if ( $c->{'status'} eq "LOGIN" ) {
+            my $buffer = $c->{'buffer_recv'};
+            $buffer =~ s/\r//og;
+            if ( $buffer =~ /\n/ ) {
+                my $client = $`;
+                $c->{'buffer_recv'} = $';
+		
+		
+                if ( length $client && (($#clients + 1 < getEnv('MaxClients')) || ($client eq 'admin') ) ) {
+                    $c->{'client'}      = $client;
+                    $c->{'buffer_send'} = 'password:';
+                    $c->{'timestamp_command'} = time;
+                    $c->{'status'}      = 'PASSWORD';
+                } else {
+                    $c->{'status'}      = 'DIS';
+                }
+            }
+        }
+        if ( $c->{'status'} eq "PASSWORD" ) {
+            my $buffer = $c->{'buffer_recv'};
+            $buffer =~ s/\r//og;
+            if ( $buffer =~ /\n/ ) {
+                my $password = $`;
+                my $client = $c->{'client'};
+                $c->{'buffer_recv'} = $';
+                if ( (length $password)
+                     && (defined getEnv("ClientPassword[$client]"))
+                     && (getEnv("ClientPassword[$client]") eq $password) ) {
+                    $c->{'buffer_send'} = '';
+                    $c->{'timestamp_command'} = time;
+                    $c->{'status'}      = 'READY';
+                    $c->{'buffer_send'} = "# \n"
+                                         ."# Session Supervising Server V.$version\n"
+                                         ."# \n"
+                                         ."\n"
+                        if $client eq 'admin';
+
+                } else {
+                    $c->{'status'}      = 'DIS';
+                }
+            }
+        }
+        if ( $c->{'status'} eq "READY" ) {
+            my $buffer = $c->{'buffer_recv'};
+            $buffer =~ s/\r//og;
+            if ( $c->{'client'} eq 'admin' ) {
+                processClientControlCommands($c, $buffer);
+            } elsif ( length($buffer) && $buffer =~ /\nEOF\n/ ) {
+	    
+	        $c->{'buffer_recv'} = $';
+		
+                $c->{'timestamp_command'} = time;
+                $c->{'timestamp_queuetime'} = ($hires)? Time::HiRes::time() : time();;
+                $c->{'command'}     = $`;
+		my %command_hash = splitCommand($c->{'command'});
+		$c->{'command_hash'} = \%command_hash;
+                $c->{'buffer_send'} = '';
+                $c->{'status'}      = 'COMMAND';
+		$c->{'timeout'}     = getEnv('MaxRuntime');
+		$c->{'wait'}        = getEnv('MaxQueuetime');
+
+
+
+            }
+        }
+    }
+}
+
+
+sub processSessions {
+    my $s;
+    foreach $s ( @sessions ) {
+        processSession($s);
+    }
+}
+
+sub sendCommand {
+    my $s = shift;
+    my $command = shift;
+    my $c = shift;
+    my %hash = splitCommand($command);
+    
+    $rate_limit_counter++;
+    $rate_limit_stack[0]++;
+    
+    my $header = {};
+    foreach my $h ( qw(RRPPROXY METAREGISTRY SESSION) ) {
+        $header = $hash{$h} if defined $hash{$h};
+    }
+
+    my $com = uc($hash{'COMMAND'}{'COMMAND'});
+    
+    $s->{'timeout'} = getEnv("MaxRuntime[$com]");
+    
+    $s->{'timeout'} = $header->{'MAXRUNTIME'} if defined $header->{'MAXRUNTIME'};
+    
+
+    $s->{'queuetime'} = 0;
+    $s->{'return_runtime'} = 1;
+    
+    $s->{'command'} = $command;
+    $s->{'command_id'} = $com;
+    $s->{'response'} = '';
+    $s->{'buffer_send'} = '';
+    $s->{'buffer_recv'} = '';
+    $s->{'status'} = 'PROCESSING';
+    $s->{'timestamp_command'} = time;
+    
+    if ( defined $c ) {
+    	$s->{'client'} = $c;
+	$s->{'queuetime'} = (($hires)? Time::HiRes::time() : time())
+	                  - $c->{'timestamp_queuetime'};
+    	$c->{'status'} = 'PROCESSING';
+
+	$c->{'nolog'} = $header->{'NOLOG'};
+    }
+
+    processSessionCommand($s);
+}
+
+
+sub sendCommand_login {
+    my $s = shift;
+    my $usr = getEnv('SessionLogin');
+    my $pwd = getEnv('SessionPassword');
+    sendCommand( $s, "[COMMAND]\ncommand=login\nlogin=$usr\npassword=$pwd\n" );
+}
+
+
+sub sendCommand_logout {
+    my $s = shift;
+    sendCommand( $s, "[COMMAND]\ncommand=logout\n" );
+}
+
+sub sendCommand_poll {
+    my $s = shift;
+    sendCommand( $s, "[COMMAND]\ncommand=poll\n" );
+}
+
+sub processIOEvents {
+
+#    return if ($#sessions < 0);
+
+    if ( getEnv("Shutdown") ) {
+	close $updSocket if $udpSocket;
+	$udpSocket = undef;
+
+	close $serviceSocket if $serviceSocket;
+	$serviceSocket = undef;
+
+	close $tcpSocket if $tcpSocket;
+	$tcpSocket = undef;
+    }
+    
+    my $vec_recv = '';
+    my $vec_send = '';
+
+    my $s;
+    foreach $s ( @sessions ) {
+        vec( $vec_recv, fileno($s->{'handle_recv'}), 1 ) = 1
+            if ( $s->{'status'} ne 'DIS' );
+        vec( $vec_recv, fileno($s->{'handle_error'}), 1 ) = 1
+            if ( $s->{'status'} ne 'DIS' );
+        vec( $vec_send, fileno($s->{'handle_send'}), 1 ) = 1
+            if ( $s->{'status'} ne 'DIS' ) && ( length $s->{'buffer_send'} > 0 );
+    }
+    my $c;
+    foreach $c ( @clients ) {
+	if ( !$c->{'udp'} ) {
+            vec( $vec_recv, fileno($c->{'handle_client'}), 1 ) = 1
+        	if ( $c->{'status'} ne 'DIS' );
+            vec( $vec_send, fileno($c->{'handle_client'}), 1 ) = 1
+                if ( $c->{'status'} ne 'DIS' ) && ( length $c->{'buffer_send'} > 0 );
+	}
+	else {
+            if ( length $c->{'buffer_send'} > 1024 ) {
+	        my $id = $c->{'id'};
+	        my $udpid = $c->{'udpid'};
+
+		my $iaddr = gethostbyname(hostname());
+		my $ip = inet_ntoa($iaddr);
+		my $port = getEnv("IPv4port");
+
+		my $r = "";
+		$r .= "id=$udpid\n";
+		$r .= "redirect=$id\n";
+		
+	        send($udpSocket, "PTF1.0/response/redirect\n" . $r, 0, $c->{'udp'});
+		$udpClients{$id} = $c->{'buffer_send'};
+		$c->{'buffer_send'} = '';
+		$c->{'status'} = 'DIS';
+		
+		my @ids = sort { $a <=> $b } keys %udpClients;
+		if ( $#ids >= 15 ) {
+		    delete $udpClients{$ids[0]};
+		}
+		print STDERR "Client-Cache: ".(join ",", @ids)."\n";
+		
+	    }
+            elsif ( length $c->{'buffer_send'} > 0 ) {
+	        my $udpid = $c->{'udpid'};
+	        send($udpSocket, "PTF1.0/response/command\nid=$udpid\n" . $c->{'buffer_send'}, 0, $c->{'udp'})
+			if ( $c->{'status'} ne 'DIS' ) && ($udpSocket) && ($udpid);
+		$c->{'buffer_send'} = '';
+		$c->{'status'} = 'DIS';
+	    }
+	}
+    }
+
+    
+#    if ( $#clients + 1 < getEnv('MaxClients') ) {
+#        vec( $vec_recv, fileno($serviceSocket), 1 ) = 1 if ($serviceSocket);
+#    }
+
+    vec( $vec_recv, fileno($serviceSocket), 1 ) = 1 if ($serviceSocket);
+    vec( $vec_recv, fileno($udpSocket), 1 ) = 1 if ($udpSocket);
+    vec( $vec_recv, fileno($tcpSocket), 1 ) = 1 if ($tcpSocket);
+    
+    my $i = select ( $vec_recv, $vec_send, undef, getEnv(IOTimeout) );
+    
+    return if $i <= 0;
+    
+    foreach $s ( @sessions ) {
+
+        if ( ( $s->{'status'} ne 'DIS' ) && vec( $vec_recv, fileno($s->{'handle_error'}), 1 ) ) {
+            my $buffer;
+            my $i = sysread $s->{'handle_error'}, $buffer, 65536;
+	    my $period = undef;
+	    if ( $s->{status} eq "PROCESSING" ) {
+                my $time = ($hires)? Time::HiRes::time() : time();
+		$period = $time - $s->{runtime_start};
+	    }
+	    if ( $i > 0 ) {
+	    	while ( $buffer =~ /^([^\n]*\n)/ ) {
+			$buffer = $';
+			logMessage($1, "LL", $period, $s);
+		}
+	        logMessage($buffer, "LL", $period, $s) if length($buffer);
+	    }
+	    if ( ($i <= 0) && ($s->{status} eq "READY") ) {
+	    	logMessage($brokenSessionResponse, "SB", 0, $s);
+	    }
+            $s->{'status'} = 'DIS' if ( $i <= 0 );
+        }
+
+        if ( ( $s->{'status'} ne 'DIS' ) && vec( $vec_recv, fileno($s->{'handle_recv'}), 1 ) ) {
+            my $buffer;
+            my $i = sysread $s->{'handle_recv'}, $buffer, 65536;
+            $s->{'buffer_recv'} .= $buffer if ( $i > 0 );
+	    if ( ($i <= 0) && ($s->{status} eq "READY") ) {
+	    	logMessage($brokenSessionResponse, "SB", 0, $s);
+	    }
+            $s->{'status'} = 'DIS' if ( $i <= 0 );
+        }
+
+        if ( ( $s->{'status'} ne 'DIS' ) && vec( $vec_send, fileno($s->{'handle_send'}), 1 ) ) {
+            my $buffer = $s->{'buffer_send'};
+            my $i = syswrite $s->{'handle_send'}, $buffer, 65536;
+            $s->{'buffer_send'} = substr $buffer, $i if ( $i > 0 );
+            $s->{'status'} = 'DIS' if ( $i <= 0 );
+        }
+    }
+    foreach $c ( @clients ) {
+	if ( !$c->{'udp'} ) {
+            if ( ( $c->{'status'} ne 'DIS' ) && vec( $vec_recv, fileno($c->{'handle_client'}), 1 ) ) {
+        	my $buffer;
+        	my $i = sysread $c->{'handle_client'}, $buffer, 65536;
+        	$c->{'buffer_recv'} .= $buffer if ( $i > 0 );
+        	$c->{'status'} = 'DIS' if ( $i <= 0 );
+        	$c->{'status'} = 'DIS' if ( $buffer eq "\004" );
+            }
+
+            if ( ( $c->{'status'} ne 'DIS' ) && vec( $vec_send, fileno($c->{'handle_client'}), 1 ) ) {
+        	my $buffer = $c->{'buffer_send'};
+        	my $i = syswrite $c->{'handle_client'}, $buffer, 65536;
+        	$c->{'buffer_send'} = substr $buffer, $i if ( $i > 0 );
+        	$c->{'status'} = 'DIS' if ( $i <= 0 );
+            }
+        }
+    }
+
+
+    handleUDPClient() if $udpSocket && ( vec( $vec_recv, fileno($udpSocket), 1 ) );
+    acceptClient()    if $serviceSocket && ( vec( $vec_recv, fileno($serviceSocket), 1 ) );
+    acceptTCPClient() if $tcpSocket && ( vec( $vec_recv, fileno($tcpSocket), 1 ) );
+}
+
+
+sub pollSession {
+    my $s = shift;
+    sendCommand_poll($s);
+}
+
+
+
+sub acceptClient {
+
+    $clientId++;
+
+    my $c = {};
+
+    $c->{'id'} = $clientId;
+    $c->{'command'} = '';
+    $c->{'response'} = '';
+    $c->{'timestamp_created'} = time;
+    $c->{'timestamp_command'} = time;
+    $c->{'buffer_send'} = '';
+    $c->{'buffer_recv'} = '';
+    $c->{'handle_client'} = new IO::Handle;
+    $c->{'paddr'} = accept( $c->{'handle_client'}, $serviceSocket );    
+    $c->{'handle_client'}->autoflush(1);
+    $c->{'status'} = 'LOGIN';
+    $c->{'buffer_send'} = 'login:';
+
+    my($path) = sockaddr_un($c->{'paddr'});
+    
+    $c->{'log_id'} = "UNIX".$clientId;
+    
+
+    push @clients, $c;
+    setEnv('clients', $#clients+1);
+    return $c;
+}
+
+
+
+sub getCommandGroupHash {
+    my $key;
+    my $hash = {};
+    foreach $key ( keys %envHash ) {
+        if ( $key =~ /^GroupCommands\[([^\]]+)\]/i ) {
+	    my $group = uc($1);
+	    my $commands = uc($envHash{$key});
+	    foreach my $command ( split /\,/, $commands ) {
+	        $hash->{$command} = [] if !exists $hash->{$command};
+		push @{$hash->{$command}}, $group;
+	    }
+	}
+    }
+    return $hash;
+}
+
+
+sub getGroupQuotaHash {
+    my $c;
+    my $groupHash = shift || getCommandGroupHash();
+    my $hash = {};
+    foreach $c ( @clients ) {
+        if ( $c->{'status'} eq 'PROCESSING' ) {
+	    my $command = uc($c->{'command_hash'}{'COMMAND'}{'COMMAND'});
+	    
+            if ( exists $groupHash->{$command} ) {
+	        my @groups = @{$groupHash->{$command}};
+		foreach my $group ( @groups ) {
+		    $hash->{$group} = 0 if !defined $hash->{$group};
+		    $hash->{$group} = $hash->{$group} + 1;
+		}
+	    }
+        }
+    }
+    return $hash;
+}
+
+
+sub postprocessSessions {
+    my $s;
+    my $c;
+    my @waiting_clients;
+    my $groupHash = getCommandGroupHash();
+    my $quotaHash = getGroupQuotaHash($groupHash);
+    
+    my $randomize_session_order = 0;
+
+    foreach $c ( @clients ) {
+        if ( $c->{'status'} eq 'COMMAND' ) {
+	    my $include = 1;
+	    
+	    if ( $c->{'command_hash'}{'METAREGISTRY'}{'REDIRECT'} ) {
+	        my $id = $c->{'command_hash'}{'METAREGISTRY'}{'REDIRECT'};
+		$c->{'status'} = "RESPONSE";
+		if ( exists $udpClients{$id} ) {
+  		    $c->{'buffer_send'} = $udpClients{$id};
+		    delete $udpClients{$id};
+		}
+		else {
+		    $c->{'buffer_send'} = "[RESPONSE]\nEOF\n";
+		}
+		next;
+	    }
+
+	    my $command = uc($c->{'command_hash'}{'COMMAND'}{'COMMAND'});
+	    my @groups = ();
+	    if ( exists $groupHash->{$command} ) {
+	        @groups = @{$groupHash->{$command}};
+	    }
+	    
+	    foreach my $group ( @groups ) {
+	        $quotaHash->{$group} = 0 if !defined $quotaHash->{$group};
+		if ( getEnv("MaxSessions[$group]") ) {
+		    $include = 0 if $quotaHash->{$group} >= getEnv("MaxSessions[$group]");
+		}
+	    }
+            if ( $include ) {
+                push @waiting_clients, $c;
+		foreach my $group ( @groups ) {
+                    $quotaHash->{$group} = $quotaHash->{$group}+1;
+		}
+	    }
+        }
+    }
+    
+    foreach $s ( @sessions ) {
+        if ( $s->{'status'} eq 'RESPONSE' ) {
+            $s->{'response'} = '';
+            $s->{'status'} = 'READY';
+        }
+        if ( ($s->{'status'} eq 'READY') && (!is_over_rate_limit()) ) {
+	
+	    my @batch_ids = keys %batch_commands;
+	    
+	    if ( @batch_ids ) {
+	    	my $id = shift @batch_ids;
+		my $command = $batch_commands{$id};
+		delete $batch_commands{$id};
+		$batch_commands_processing++;
+		sendCommand($s, $command);
+		$s->{'client'} = undef;
+		$s->{'batch_id'} = $id;
+		$s->{'batch_command'} = $command;
+		
+		$randomize_session_order = 1;
+		
+		print STDERR "Sumbitting Batch Command $id ...\n$command\n";
+	    }
+	    else {
+	            $c = shift @waiting_clients;
+	            if ( $c ) {
+	                sendCommand($s, $c->{'command'}, $c);
+			
+			$randomize_session_order = 1;
+	            }
+	    }
+        }
+        if ( $s->{'status'} eq 'READY' ) {
+            if ( time - $s->{'timestamp_command'} >= getEnv('SessionPollInterval') ) {
+                pollSession($s);
+            }
+        }
+    }
+    
+    push @sessions, shift @sessions
+    	if $randomize_session_order;
+}
+
+
+sub prepareClients {
+    my $c;
+    
+    my $time = ($hires)? Time::HiRes::time() : time();
+    
+    foreach $c ( @clients ) {
+        if ( ($c->{'status'} eq 'LOGIN') || ($c->{'status'} eq 'PASSWORD') ) {
+            if ( $time - $c->{'timestamp_command'} >= getEnv('ClientLoginTimeout') ) {
+                $c->{'status'} = 'DIS';
+            }
+        }
+        if ( $c->{'status'} eq 'COMMAND' ) {
+            if ( $time - $c->{'timestamp_command'} >= $c->{'wait'} ) {
+	    	my $queuetime = $time - $c->{'timestamp_command'};
+                $c->{'status'} = 'RESPONSE';
+		if ( !getEnv("SessionsOnline") ) {
+			$c->{'response'} = $nosessionsResponse;
+			$c->{'buffer_send'} = $nosessionsResponse . "\nEOF\n";
+			logMessage($c->{command}, "QT", $queuetime, undef, $c);
+			logMessage($nosessionsResponse, "OF", $queuetime, undef, $c);
+		}
+		else {
+	                $c->{'response'} = $overloadResponse;
+	                $c->{'buffer_send'} = $overloadResponse . "\nEOF\n";
+			logMessage($c->{command}, "QT", $queuetime, undef, $c);
+			logMessage($overloadResponse, "OV", $queuetime, undef, $c);
+		}
+            }
+	    elsif ( ($last_offline_time + 30) > time() ) {
+	    	my $queuetime = $time - $c->{'timestamp_command'};
+                $c->{'status'} = 'RESPONSE';
+		if ( !getEnv("SessionsOnline") ) {
+			$c->{'response'} = $nosessionsResponse;
+			$c->{'buffer_send'} = $nosessionsResponse . "\nEOF\n";
+			logMessage($c->{command}, "QT", $queuetime, undef, $c);
+			logMessage($nosessionsResponse, "OF", $queuetime, undef, $c);
+		}
+	    }
+        }
+    }
+
+    my $i = 0;
+    while ( $i <= $#clients ) {
+        if ( $clients[$i]->{'status'} eq 'DIS' ) {
+	    if ( !($clients[$i]->{'udp'}) ) {
+        	shutdown $clients[$i]->{'handle_client'}, 2;
+        	close $clients[$i]->{'handle_client'};
+	    }
+            my $id = $clients[$i]->{'id'};
+	    delete $logClients{$clients[$i]};
+            $clients[$i] = $clients[$#clients];
+            pop @clients;
+            setEnv('clients', $#clients+1);
+        } else {
+            $i++;
+        }
+    }
+}
+
+
+
+sub postprocessClients {
+    my $c;
+    foreach $c ( @clients ) {
+        if ( ( $c->{'status'} eq 'RESPONSE' ) && !length($c->{'buffer_send'})) {
+            $c->{'status'} = 'READY';
+            $c->{'command'} = '';
+            $c->{'response'} = '';
+        }
+    }
+}
+
+
+sub prepareSessions {
+
+    my $s;
+    foreach $s ( @sessions ) {
+        if ($s->{'status'} eq 'PROCESSING') {
+	    my $timeout = $s->{'timeout'} || getEnv('MaxRuntime');
+            if ( time - $s->{'timestamp_command'} >= $timeout ) {
+                $s->{'status'} = 'DIS';
+		finishSessionResponse($s, $timeoutResponse, "TO");
+            }
+        }
+    }
+
+    my $i = 0;
+    while ( $i <= $#sessions ) {
+        if ( $sessions[$i]->{'status'} eq 'DIS' ) {
+            close $sessions[$i]->{'handle_send'};
+            close $sessions[$i]->{'handle_recv'};
+            close $sessions[$i]->{'handle_error'};
+            kill 1, $sessions[$i]->{'pid'};
+#            waitpid $sessions[$i]->{'pid'}, 0;
+	    
+            if ( (defined $sessions[$i]->{'log_buffer'})
+	    	|| (defined $sessions[$i]->{'client'})
+		|| (defined $sessions[$i]->{'batch_id'}) ) {
+		finishSessionResponse($sessions[$i], $brokenSessionResponse, "SB");
+            }
+	    
+            my $id = $sessions[$i]->{'id'};
+            my $s = $sessions[$i];
+            $sessions[$i] = $sessions[$#sessions];
+            pop @sessions;
+            setEnv('sessions', $#sessions+1);
+	    if ( $s->{'online'} ) {
+        	my $sessions_online = getEnv("SessionsOnline") || 0;
+        	$sessions_online-- if $sessions_online > 0;
+		delete $s->{'online'};
+		setEnv("SessionsOnline", $sessions_online);
+	    }
+	    else {
+	    	$last_offline_time = time();
+	    }
+        } else {
+            $i++;
+        }
+    }
+
+    my $sessionsWanted = 0;
+
+    my $c;
+    foreach $c ( @clients ) {
+        $sessionsWanted++ if $c->{'status'} eq 'COMMAND';
+        $sessionsWanted++ if $c->{'status'} eq 'PROCESSING';
+#        $sessionsWanted++ if $c->{'status'} eq 'DIS';
+    }
+    $sessionsWanted = getEnv('MinSessions')
+        if $sessionsWanted < getEnv('MinSessions');
+    if ( -e '/etc/sessiond/use_max_sessions' ) {
+      $sessionsWanted = getEnv('MaxSessions')
+          if $sessionsWanted < getEnv('MaxSessions');
+    }
+    $sessionsWanted = getEnv('MaxSessions')
+        if $sessionsWanted > getEnv('MaxSessions');
+
+    if ( !getEnv('Shutdown') ) {
+	while ( (time() > $start_next_session_time) && ($#sessions + 1 < $sessionsWanted) ) {
+            openSession();
+	    $start_next_session_time = time() + $session_start_delay;
+	}
+    }
+    
+    my $overload = ($#sessions + 1) - getEnv('MaxSessions');
+    foreach $s ( @sessions ) {
+        if ( $s->{'status'} eq 'READY' ) {
+	    if ( $s->{'term_on'} && ($s->{'term_on'} < time() ) ) {
+	    	$s->{'term'} = 1;
+	    }
+            if ( time - $s->{'timestamp_created'} >= getEnv('MaxSessionTTL') ) {
+                closeSession($s);
+                $overload--;
+            }
+	    elsif ( $s->{'term'} ) {
+                closeSession($s);
+                $overload--;
+	    }
+        }
+    }
+    foreach $s ( @sessions ) {
+        if ( ($overload > 0) && ($s->{'status'} eq 'READY') ) {
+            closeSession($s);
+            $overload = 0;
+        }
+    }
+    
+    $overload = ($#sessions + 1) - $sessionsWanted;
+    for ( $i = 0; $i < $overload; $i++ ) {
+        if ( ($sessions[$i]->{'status'} eq 'READY') 
+             && (time - $sessions[$i]->{'timestamp_command'} >= getEnv('MinSessionTTL')) ) {
+            closeSession($sessions[$i]);
+        }
+    }
+}
+
+
+
+sub openSession {
+    my $s = createSession();
+    logMessage("NEW SESSION", "NS", undef, $s);
+    $s->{'runtime_start'} = ($hires)? Time::HiRes::time() : time();
+    $sessionId++;
+    $s->{'id'} = $sessionId;
+    push @sessions, $s;
+    setEnv('sessions', $#sessions+1);
+    return $s;
+}
+
+
+sub daemonize {
+    chdir '/'               or die "Can't chdir to /: $!";
+    open STDIN, '/dev/null' or die "Can't read /dev/null: $!";
+    open STDOUT, '>/dev/null'
+                            or die "Can't write to /dev/null: $!";
+    defined(my $pid = fork) or die "Can't fork: $!";
+    exit if $pid;
+    setsid                  or die "Can't start a new session: $!";
+    open STDERR, '>&STDOUT' or die "Can't dup stdout: $!";
+}
+
+sub rotateLogfiles {
+    my $proto = shift || "";
+    my $maxSize = getEnv("Max".$proto."LogFileSize");
+    my $file = getEnv($proto."LogFile");
+
+    my $count = getEnv("Max".$proto."LogFileCount");
+    my $remove = getEnv("Remove".$proto."LogFile");
+    if ( (defined $maxSize) && (defined $file) && (-e $file) ) {
+        $maxSize = $` << 10 if $maxSize =~ /KB$/i;
+        $maxSize = $` << 20 if $maxSize =~ /MB$/i;
+        $maxSize = $` << 30 if $maxSize =~ /GB$/i;
+	$count = 1 if !$count;
+	$count--;
+	my $size = -s $file;
+	if  ( $size > $maxSize ) {
+
+	    return if -e "$file.lock";
+	    link $file, "$file.lock" or return;
+
+		if ( $logFile && ($proto eq "") ) {
+			close $logFile;
+			$logFile = undef;
+		}
+	
+	    my $i;
+	    for ( $i = $count-1; $i >= 0; $i-- ) {
+	        if ( -e "$file.$i" ) {
+		    link "$file.$i", "$file.".($i+1);
+		    unlink "$file.$i";
+		}
+	    }
+	    link $file, "$file.0";
+	    unlink $file;
+	   
+	    if ( -e "$file.$count" ) {
+	        link "$file.$count", "$file.rem";
+		unlink "$file.$count";
+	    }
+	    if ( -e "$file.rem" ) {
+	        if ( fork() ) {}
+		else {
+		    if ( defined $remove ) {
+		        system("$remove $file.rem");
+		    }
+		    else {
+		        unlink "$file.rem";
+		    }
+		    exit;
+		}
+	    }
+	    unlink "$file.lock";
+	}
+    }
+    
+}
+
+my $piddir = "/var/run/sessiond";
+
+
+sub check_for_other_instances {
+    my $check_instances = 1;
+    while ( $check_instances ) {
+	my $s = $opmode.":".hostname().":";
+	my $pidfile = $opmode.":".hostname().":$$";
+	$check_instances = 0;
+	opendir PIDDIR, $piddir;
+	my @files = readdir PIDDIR;
+	closedir PIDDIR;
+	foreach my $file ( @files ) {
+	    if ( ($s eq substr($file, 0, length($s))) && ($file ne $pidfile) ) {
+		print STDERR "Found another instance: $file! Sleeping 0 seconds...\n";
+		unlink "$piddir/$file";
+		sleep 0;
+		$check_instances = 1;
+	    }
+	}
+    }
+}
+
+
+sub create_pidfile {
+    my $pidfile = $opmode.":".hostname().":".$$;
+    mkdir $piddir if !-e $piddir;
+
+    print STDERR "$piddir/$pidfile\n";
+
+    unlink "$piddir/$pidfile";
+    open PID, ">$piddir/$pidfile";
+    print PID "";
+    close PID;
+    return $pidfile;
+}
+
+
+sub is_over_rate_limit {
+	my $rate_limit = getEnv("MaxCommandRate");
+	return undef if !defined $rate_limit;
+	
+	return undef if $rate_limit !~ /^(\d+)\/(\d+)$/;
+	
+	my $max = $1;
+	my $seconds = $2;
+	
+	return 1 if $rate_limit_counter >= $max;
+	return 0;
+}
+
+
+sub refresh_rate_limit_stack {
+	my $new_rate_limit_check_time = ($hires)? Time::HiRes::time() : time();
+	my $timediff = int($new_rate_limit_check_time - $rate_limit_check_time);
+	
+	return if $timediff < 1;
+
+	$rate_limit_check_time = $new_rate_limit_check_time;
+	
+	my $rate_limit = getEnv("MaxCommandRate") || "";	
+	if ( $rate_limit !~ /^(\d+)\/(\d+)$/ ) {
+		$rate_limit_counter = 0;
+		@rate_limit_stack = (0);
+		return;
+	}
+	
+	my $max = $1;
+	my $seconds = $2;
+	
+	foreach ( 1..$timediff ) {
+		unshift @rate_limit_stack, 0;
+	}
+	
+	while ( ($#rate_limit_stack+1) > $seconds ) {
+		$rate_limit_counter -= pop @rate_limit_stack;
+	}
+	
+#	use Data::Dumper; print STDERR Dumper(\@rate_limit_stack);
+	
+	return;
+}
+
+
+
+exit 1 if loadEnv(getEnv('ConfigFile'));
+
+setEnv('OperationState', 'OFFLINE');
+require "./opmode/".uc(getEnv('OperationMode')).".pl";
+
+$0 = "SESSIOND: ".$opmode;
+
+check_for_other_instances();
+
+openServiceSocket();
+openTCPSocket();
+openUDPSocket();
+
+print STDERR "starting sessiond ...\n";
+daemonize()
+    if (getEnv("Daemonize")) && (!$ENV{NODAEMON});
+
+setEnv("SessionsOnline", 0);
+
+my $pidfile = create_pidfile();
+my $pidmod = -M "$piddir/$pidfile";
+
+$SIG{'HUP'} = sub {
+    unlink "$piddir/$pidfile";
+    open PID, ">$piddir/$pidfile";
+    print PID "";
+    close PID;
+};
+$SIG{'TERM'} = sub {
+    unlink "$piddir/$pidfile";
+};
+$SIG{'KILL'} = sub {
+    unlink "$piddir/$pidfile";
+};
+$SIG{'PIPE'} = 'IGNORE';
+
+
+check_for_other_instances();
+exit if !-e "$piddir/$pidfile";
+
+
+load_batch();
+
+wait_to_start();
+
+sub main {
+
+    while ( 1 ) {
+
+	load_batch() if (!keys %batch_commands) && (!$batch_commands_processing);
+
+        if ( !-e "$piddir/$pidfile" ) {
+	processClientControlCommand_SHUTDOWN() ;
+        }
+	elsif ( $pidmod != -M "$piddir/$pidfile" ) {
+            processClientControlCommand_RESET();
+	    $pidmod = -M "$piddir/$pidfile";
+	}
+	
+	updateMaster();
+
+	prepareSessions();
+	prepareClients();
+	processIOEvents();
+	refresh_rate_limit_stack();
+	processSessions();
+	processClients();
+	postprocessSessions();
+	postprocessClients();
+	rotateLogfiles();
+	rotateLogfiles("Protocol");
+	waitpid(-1, WNOHANG);
+
+	if ( getEnv('TerminateSessions') ) {
+            terminateSessions();
+	}
+	if ( (!@sessions) && getEnv('Shutdown') ) {
+	    unlink "$piddir/$pidfile" if -e "$piddir/$pidfile";
+	    unlink $serviceSocketFile if -e $serviceSocketFile;
+            exit;
+	}
+    }
+
+}
+
+main();

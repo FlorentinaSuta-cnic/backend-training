@@ -1,0 +1,110 @@
+#!/usr/bin/perl -w
+
+use strict;
+use FindBin;
+
+my $dir = $FindBin::Bin;
+my $pdir = $` if $dir =~ /\/[^\/]+$/;
+
+my $init_dir = '/etc/init.d';
+
+
+do_install()     if $0 =~ /install$/;
+do_update()      if $0 =~ /update$/;
+do_update_all()  if $0 =~ /update_all$/;
+do_remove()      if $0 =~ /remove$/;
+do_remove_all()  if $0 =~ /remove_all$/;
+
+die "ERROR: Command $0 not valid\n";
+
+
+
+sub create_init_script {
+    my $config = shift;
+    die "ERROR: Missing parameter: <config>\n"
+        if !defined $config;
+    die "ERROR: File $pdir/config/$config does not exist"
+        if !-e "$pdir/config/$config";
+    
+    my $init = `$dir/_create-init-script $config`;
+    $init = `$dir/_create-init-script-$config`
+        if -e "$dir/_create-init-script-$config";
+	   
+    open INIT, ">$init_dir/sessiond-$config"
+        or die "ERROR: Could not write to $init_dir/sessiond-$config\n";
+    print INIT $init;
+    close INIT;
+    
+    system("chmod +x $init_dir/sessiond-$config");
+}
+
+
+sub find_installed {
+    opendir DIR, "$init_dir"
+        or die "Could not open dir $init_dir\n";
+    my @configs = ();
+    foreach ( readdir DIR ) {
+        push @configs, $' if /^sessiond-/;
+    }
+    closedir DIR;
+    return @configs;
+}
+
+
+
+sub do_install {
+    my $config = shift @ARGV;
+    die "ERROR: Missing parameter: <config>\n"
+        if !defined $config;
+    die "ERROR: File $init_dir/sessiond-$config already exists\n"
+        if -e "$init_dir/sessiond-$config";
+    create_init_script($config);
+    system("update-rc.d sessiond-$config start 99 2 3 4 5 . stop 99 0 1 6 .");
+    exit 0;
+}
+
+sub do_update {
+    my $config = shift @ARGV;
+    die "ERROR: Missing parameter: <config>\n"
+        if !defined $config;
+    die "ERROR: File $init_dir/sessiond-$config does not exist\n"
+        if !-e "$init_dir/sessiond-$config";
+    create_init_script($config);
+    system("update-rc.d -f sessiond-$config remove");
+    system("update-rc.d sessiond-$config start 99 2 3 4 5 . stop 99 0 1 6 .");
+    exit 0;
+}
+
+sub do_update_all {
+    foreach my $config ( find_installed() ) {
+        print STDERR "Updating $config...\n";
+	create_init_script($config);
+	system("update-rc.d -f sessiond-$config remove");
+	system("update-rc.d sessiond-$config start 99 2 3 4 5 . stop 99 0 1 6 .");
+    }
+    exit 0;
+}
+
+sub do_remove {
+    my $config = shift @ARGV;
+    die "ERROR: Missing parameter: <config>\n"
+        if !defined $config;
+    die "ERROR: File $init_dir/sessiond-$config does not exist\n"
+        if !-e "$init_dir/sessiond-$config";
+    system("update-rc.d -f sessiond-$config remove");
+    unlink "$init_dir/sessiond-$config";
+    exit 0;
+}
+
+sub do_remove_all {
+    foreach my $config ( find_installed() ) {
+        print STDERR "Removing $config...\n";
+	create_init_script($config);
+        system("update-rc.d -f sessiond-$config remove");
+        unlink "$init_dir/sessiond-$config";
+    }
+    exit 0;
+}
+
+
+

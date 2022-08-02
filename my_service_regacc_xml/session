@@ -1,0 +1,19 @@
+#!/usr/bin/perl -w
+#
+# (c)2008 HEXONET Support GmbH, 66424 Homburg, Germany
+#
+
+use lib "/opt/service/lib/";
+use framework;
+
+# load all required libraries, 
+framework::init(shift @ARGV, $ENV{DEBUG});
+
+framework::execute_argv_command();
+
+framework::session();
+
+if ( (ref $SIG{TERM}) eq "CODE" ) {
+	my $term = $SIG{TERM}; &$term();
+}
+

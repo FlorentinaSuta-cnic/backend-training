@@ -1,0 +1,299 @@
+#!/usr/bin/perl -w
+
+use FindBin;
+use lib "$FindBin::Bin/lib";
+
+use POSIX 'setsid';
+
+$SIG{'PIPE'} = 'IGNORE';
+
+sub daemonize {
+               chdir '/'               or die "Can't chdir to /: $!";
+               open STDIN, '/dev/null' or die "Can't read /dev/null: $!";
+               open STDOUT, '>/dev/null'
+                                       or die "Can't write to /dev/null: $!";
+               defined(my $pid = fork) or die "Can't fork: $!";
+               exit if $pid;
+               setsid                  or die "Can't start a new session: $!";
+               open STDERR, '>&STDOUT' or die "Can't dup stdout: $!";
+           }
+
+
+use IO::Socket::UNIX;
+use IO::Socket::INET;
+
+my $master_url = shift @ARGV or die "Missing parameter master url\n";
+
+die "Invalid master url\n" if $master_url !~ /^mregd(?:\+udp)?:\/\/([^:]+):([^\@]+)\@/;
+
+my $file = "/tmp/ServiceCache";
+
+$0 = "CACHE $file => $master_url";
+
+my $master_user = $1;
+my $master_pass = $2;
+my $master_addr = $';
+
+unlink $file;
+my $server = new IO::Socket::UNIX (
+    Local => $file,
+    Listen => 64,
+);
+
+chmod 0777, $file if $server;
+
+my %clients = ();
+my $master = undef;
+my $next_master = time();
+
+my %services = (
+    "." => $master_url,
+);
+
+my $uuid = "";
+
+daemonize() if !$ENV{NODAEMON};
+
+while ( 1 ) {
+    openMaster();
+    handleSockets();
+}
+
+
+sub openMaster {
+
+    if ( (defined $master) && ($master->{timestamp}+10 < time()) ) {#
+        print STDERR "Connection to master [$master_addr] timed out\n";
+        $master = undef;
+    }
+
+
+    return $master if $master;
+    return $master if time() < $next_master;
+    
+    print STDERR "Connecting to master: $master_addr\n";
+    
+    my $socket = new IO::Socket::INET (
+        PeerAddr => $master_addr,
+	Blocking => 0,
+    );
+    $master = {
+        socket => $socket,
+        sbuffer => "$master_user\n$master_pass\n[COMMAND]\ncommand=QueryServiceList\nUUID=$uuid\nEOF\n",
+	rbuffer => "",
+	timestamp => time(),
+    };
+    $next_master = time()+10;
+    print STDERR "return...\n";
+    return $master;
+}
+
+
+
+sub parseList {
+    my $data = shift;
+    
+    my $response = mreg_parse_response($data);
+    return if $response->{CODE} != 200;
+    
+    my @rows = ();
+    @rows = @{$response->{PROPERTY}{SERVICE}}
+        if exists $response->{PROPERTY}{SERVICE};
+
+    if ( exists $response->{PROPERTY}{UUID} ) {
+        $uuid = $response->{PROPERTY}{UUID}[0];
+    }
+    
+#    print STDERR "Got new dataset!\n$data\n";
+    
+    %services = (
+        "." => $master_url,
+    );
+    
+    foreach my $row ( @rows ) {
+        if ( $row =~ / / ) {
+	    my $id = $`;
+	    my $url = $';
+	    print STDERR "Found [$id] on [$url]\n";
+	    $services{$id} .= " $url" if exists $services{$id};
+	    $services{$id} = $url if !exists $services{$id};
+	}
+    }
+}
+
+
+sub mreg_parse_response {
+    my $response = shift;
+
+    return () if !defined $response;
+
+    my %hash;
+
+    foreach ( split /\n/, $response ) {
+        if ( /^([^\=:]*[^\t\= ])[\t ]*=[\t ]*/ ) {
+            my $attr = $1;
+            my $value = $';
+            $value =~ s/[\t ]*$//;
+            if ( $attr =~ /^property\[([^\]]*)\]/i ) {
+                my $prop = uc $1;
+                $prop =~ s/\s//og;
+                if ( exists $hash{"PROPERTY"}->{$prop} ) {
+                    push @{$hash{"PROPERTY"}->{$prop}}, $value;
+                }
+                else {
+                     $hash{"PROPERTY"}->{$prop} = [$value];
+                }
+            }
+            else {
+                $hash{uc $attr} = $value;
+            }
+        }
+        elsif ( /:([^\n]*)/ ) {
+            my $attr = $`;
+            my $value = $1;
+            if ( $attr =~ /^property\[([^\]]*)\]/i ) {
+                my $prop = uc $1;
+                $prop =~ s/\s//og;
+                if ( exists $hash{"PROPERTY"}->{$prop} ) {
+                    push @{$hash{"PROPERTY"}->{$prop}}, $value;
+                }
+                else {
+                     $hash{"PROPERTY"}->{$prop} = [$value];
+                }
+            }
+            else {
+                $hash{uc $attr} = $value;
+            }
+        }
+    }
+
+    if ( !exists $hash{'CODE'} ) {
+        $hash{'CODE'} = 421;
+        $hash{'DESCRIPTION'} = "Service is temporarily not available";
+    }
+    return \%hash;
+}
+
+
+sub handleCommand {
+    my $command = shift;
+    print STDERR "Command: $command\n";
+    if ( $command =~ /^LOCATE SERVICE /i ) {
+        my $target = $';
+	if ( exists $services{$target} ) {
+	    return "OK $services{$target}\n";
+	}
+	return "ERROR Cannot locate\n";
+    }
+    return "ERROR Invalid command\n";
+}
+
+
+sub handleSockets {
+    my $timeleft = 10;
+
+    my $vec_send = '';
+    my $vec_recv = '';
+    vec( $vec_recv, fileno($server), 1 ) = 1;
+
+    if ( $master ) {
+        vec( $vec_recv, fileno($master->{socket}), 1 ) = 1
+	    if !length($master->{sbuffer});
+        vec( $vec_send, fileno($master->{socket}), 1 ) = 1
+	    if length($master->{sbuffer});
+    }
+    
+    foreach my $client ( keys %clients ) {
+        vec( $vec_recv, fileno($clients{$client}->{socket}), 1 ) = 1
+	    if !length($clients{$client}->{sbuffer});
+        vec( $vec_send, fileno($clients{$client}->{socket}), 1 ) = 1
+	    if length($clients{$client}->{sbuffer});
+    }
+
+    if ( 1 ) {
+        my $nfound;
+        ($nfound,$timeleft) = select ( $vec_recv, $vec_send, undef, $timeleft );
+        if ( $nfound >= 1 ) {
+            if ( vec( $vec_recv, fileno($server), 1 ) ) {
+                my $client = $server->accept();
+		my $info = {
+		    socket => $client,
+		    sbuffer => "",
+		    rbuffer => "",
+		};
+		$clients{$client} = $info;
+		print STDERR "New client\n";
+            }
+	    
+	    if ( $master && vec( $vec_recv, fileno($master->{socket}), 1 ) ) {
+	        my $data;
+		my $i = sysread $master->{socket}, $data, 65536;
+		if ( (defined $i) && ($i > 0) ) {
+		    $master->{rbuffer} .= $data;
+		    $master->{timestamp} = time();
+		    if ( $master->{rbuffer} =~ /\nEOF\n$/ ) {
+		        parseList($master->{rbuffer});
+			$master = undef;
+		    }
+		}
+     	        else {
+                    print STDERR "Connection to master [$master_addr] broken while receiving\n";
+		    $master = undef;
+		}
+	    }
+	    
+	    if ( $master && vec( $vec_send, fileno($master->{socket}), 1 ) ) {
+	        my $data = $master->{sbuffer};
+		my $i = syswrite $master->{socket}, $data, 65536;
+		if ( (defined $i) && ($i > 0) ) {
+		    $master->{sbuffer} = substr $data, $i;
+		    $master->{timestamp} = time();
+		}
+		else {
+                    print STDERR "Connection to master [$master_addr] timed out\n";
+		    $master = undef;
+		}
+	    }
+	    
+            foreach my $client ( keys %clients ) {
+	        my $socket = $clients{$client}->{socket};
+
+        	if ( $socket && vec( $vec_recv, fileno($socket), 1 ) ) {
+		    my $data;
+  		    my $i = sysread $socket, $data, 65536;
+		    if ( (defined $i) && ($i > 0) ) {
+		        $clients{$client}->{rbuffer} .= $data;
+		        if ( $clients{$client}->{rbuffer} =~ /\n$/ ) {
+			    my $command = $`;
+			    $clients{$client}->{rbuffer} = $';
+			    $clients{$client}->{sbuffer} .= handleCommand($command);
+		        }
+		    }
+		    else {
+		        delete $clients{$client};
+			print STDERR "Client disconnected\n";
+			$socket = undef;
+		    }
+		}
+
+	        if ( $socket && vec( $vec_send, fileno($socket), 1 ) ) {
+	            my $data = $clients{$client}->{sbuffer};
+		    my $i = syswrite $socket, $data, 65536;
+		    if ( (defined $i) && ($i > 0) ) {
+		        $clients{$client}->{sbuffer} = substr $data, $i;
+	  	    }
+		    else {
+		        delete $clients{$client};
+                        print STDERR "Client disconnected while sending\n";
+			$socket = undef;
+		    }
+	        }
+            }
+        }
+    }
+
+}
+
+
+
+
