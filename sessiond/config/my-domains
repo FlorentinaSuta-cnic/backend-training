@@ -13,7 +13,7 @@ Daemonize                = 0
 ServiceCache             = /tmp/ServiceCache
 
 
-ServiceID                = YOURNAME-domains
+ServiceID                = my-domains
 ShellCommand             = /opt/my_service_domains/session
 ServiceSocket            = /tmp/my-domains
 LogFile                  = /var/log/my-domains.log

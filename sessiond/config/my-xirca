@@ -13,7 +13,7 @@ Daemonize                = 0
 ServiceCache             = /tmp/ServiceCache
 
 
-ServiceID                = YOURNAME-xirca
+ServiceID                = my-xirca
 ShellCommand             = /opt/my_xirca/session
 ServiceSocket            = /tmp/my-xirca
 LogFile                  = /var/log/my-xirca.log

@@ -13,7 +13,7 @@ Daemonize                = 0
 ServiceCache             = /tmp/ServiceCache
 
 
-ServiceID                = YOURNAME-regacc-hexonet
+ServiceID                = my-regacc-hexonet
 ShellCommand             = /opt/my_service_regacc_xml/session dotHEXONET
 ServiceSocket            = /tmp/my-regacc-hexonet
 LogFile                  = /var/log/my-regacc-hexonet.log
